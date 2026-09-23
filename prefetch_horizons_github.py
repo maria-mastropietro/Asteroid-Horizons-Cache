@@ -48,55 +48,111 @@ def object_csv_path(input_dir: Path, obj: str):
     """
     Find the object's CSV recursively anywhere under input_dir.
 
-    Current convention:
-        2006 GQ59 -> 2006_GQ59.csv
+    Supported filename conventions, in this order:
 
-    No _ALL suffix is used.
+        Rubin / EDP2:
+            2006 GQ59 -> 2006_GQ59.csv
+            99414     -> 99414.csv
+
+        Asteroid Institute:
+            permanent designation   -> permid_99414_ALL.csv
+            provisional designation -> provid_2015_BB627_ALL.csv
+
+    Both Asteroid Institute prefixes are tried automatically, so the caller does
+    not need to know whether the object is stored as a permanent or provisional ID.
     """
-    filename = f"{safe_slug(obj)}.csv"
+    slug = safe_slug(obj)
 
-    direct = input_dir / filename
-    if direct.is_file():
-        return direct
+    filenames = [
+        f"{slug}.csv",
+        f"permid_{slug}_ALL.csv",
+        f"provid_{slug}_ALL.csv",
+    ]
 
-    matches = sorted(p for p in input_dir.rglob(filename) if p.is_file())
+    # Prefer direct matches under input_dir, preserving the priority above.
+    for filename in filenames:
+        direct = input_dir / filename
+        if direct.is_file():
+            return direct
 
-    if not matches:
-        return None
+    # Then search recursively, again preserving the same priority.
+    for filename in filenames:
+        matches = sorted(p for p in input_dir.rglob(filename) if p.is_file())
 
-    if len(matches) > 1:
-        print(
-            f"[WARNING] Multiple CSVs found for {obj}; using {matches[0]}",
-            file=sys.stderr,
-            flush=True,
-        )
-        for extra in matches[1:]:
-            print(f"          also found: {extra}", file=sys.stderr, flush=True)
+        if not matches:
+            continue
 
-    return matches[0]
+        if len(matches) > 1:
+            print(
+                f"[WARNING] Multiple CSVs found for {obj} using pattern "
+                f"{filename}; using {matches[0]}",
+                file=sys.stderr,
+                flush=True,
+            )
+            for extra in matches[1:]:
+                print(
+                    f"          also found: {extra}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+
+        return matches[0]
+
+    return None
 
 
 def read_mjd_range(csv_path: Path) -> tuple[float, float]:
-    wanted = {"midpointMjdTai", "mjd", "midPointMjdTai"}
+    """
+    Read the observation time range from either supported CSV format.
+
+    Rubin / EDP2:
+        midpointMjdTai
+        midPointMjdTai   (legacy capitalization)
+
+    Asteroid Institute:
+        mjd
+
+    Fallback:
+        obs_time         (ISO/date-time string, converted to MJD)
+    """
+    wanted = {"midpointMjdTai", "midPointMjdTai", "mjd", "obs_time"}
 
     df = pd.read_csv(csv_path, usecols=lambda c: c in wanted)
 
     if "midpointMjdTai" in df.columns:
         col = "midpointMjdTai"
-    elif "mjd" in df.columns:
-        col = "mjd"
+        mjd = pd.to_numeric(df[col], errors="coerce").dropna()
+
     elif "midPointMjdTai" in df.columns:
         col = "midPointMjdTai"
+        mjd = pd.to_numeric(df[col], errors="coerce").dropna()
+
+    elif "mjd" in df.columns:
+        col = "mjd"
+        mjd = pd.to_numeric(df[col], errors="coerce").dropna()
+
+    elif "obs_time" in df.columns:
+        col = "obs_time"
+        obs_time = pd.to_datetime(df[col], utc=True, errors="coerce").dropna()
+
+        if obs_time.empty:
+            mjd = pd.Series(dtype=float)
+        else:
+            # Unix epoch 1970-01-01 00:00:00 UTC corresponds to MJD 40587.0.
+            unix_seconds = obs_time.astype("int64") / 1e9
+            mjd = unix_seconds / 86400.0 + 40587.0
+
     else:
         raise ValueError(
             f"{csv_path} has no supported time column. "
-            "Expected midpointMjdTai."
+            "Expected one of: midpointMjdTai, midPointMjdTai, mjd, obs_time."
         )
 
-    mjd = pd.to_numeric(df[col], errors="coerce").dropna()
-
-    if mjd.empty:
-        raise ValueError(f"No valid MJD values found in {csv_path}")
+    if len(mjd) == 0:
+        raise ValueError(
+            f"No valid observation times found in {csv_path} "
+            f"using column {col}."
+        )
 
     return float(mjd.min()), float(mjd.max())
 
@@ -553,10 +609,13 @@ def main() -> int:
         )
 
         if csv_path is None:
+            slug = safe_slug(obj)
             msg = (
-                f"{obj}: "
-                f"{safe_slug(obj)}.csv "
-                f"not found anywhere under "
+                f"{obj}: none of "
+                f"{slug}.csv, "
+                f"permid_{slug}_ALL.csv, or "
+                f"provid_{slug}_ALL.csv "
+                f"were found anywhere under "
                 f"{args.input_dir}"
             )
 
