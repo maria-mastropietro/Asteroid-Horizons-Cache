@@ -379,8 +379,19 @@ def query_and_save(
 
     mjd_min, mjd_max = read_mjd_range(csv_path)
 
+    # The cache filename represents the requested photometric interval plus the
+    # normal padding used by the downstream period codes.
     start_mjd = mjd_min - pad_minutes / 1440.0
     stop_mjd = mjd_max + pad_minutes / 1440.0
+
+    # Query Horizons one full sampling step wider on both sides. Horizons returns
+    # a discrete cadence grid, so a query that starts/ends exactly at start_mjd /
+    # stop_mjd can otherwise return its first/last sample slightly inside those
+    # boundaries. The wider query guarantees that the saved cache data covers
+    # the interval encoded in the filename.
+    step_days = step_minutes / 1440.0
+    query_start_mjd = start_mjd - step_days
+    query_stop_mjd = stop_mjd + step_days
 
     out_path = build_cache_path(
         output_dir,
@@ -401,14 +412,14 @@ def query_and_save(
         return out_path
 
     chunks = make_chunks(
-        start_mjd,
-        stop_mjd,
+        query_start_mjd,
+        query_stop_mjd,
         step_minutes,
     )
 
     total_estimated = estimate_rows(
-        start_mjd,
-        stop_mjd,
+        query_start_mjd,
+        query_stop_mjd,
         step_minutes,
     )
 
@@ -453,6 +464,20 @@ def query_and_save(
         raise RuntimeError(
             f"Only {len(out)} usable rows remained "
             f"after merging for {target_id}"
+        )
+
+    # Verify the actual returned Horizons rows cover the interval represented by
+    # the cache filename. This catches an endpoint/cadence problem before the
+    # cache is committed to the repository.
+    tol = 1e-6
+    actual_start = float(out["mjd"].min())
+    actual_stop = float(out["mjd"].max())
+
+    if actual_start > start_mjd + tol or actual_stop < stop_mjd - tol:
+        raise RuntimeError(
+            "Horizons result does not cover the requested cache interval: "
+            f"requested={start_mjd:.6f}..{stop_mjd:.6f}, "
+            f"returned={actual_start:.6f}..{actual_stop:.6f}"
         )
 
     output_dir.mkdir(
